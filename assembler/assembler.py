@@ -1,142 +1,123 @@
-import math
-import os
+#!/usr/bin/env python3
+import argparse
 import sys
-
-instruction_file = "instructions.s"
-output_file = "instruction.mem"
-
-# Field widths: [addr_1, addr_2, addr_3, jump, data]
-width = [15, 15, 15, 11, 8]
-total_width = sum(width)
-
-if total_width != 64:
-    sys.exit(f"Error: Bit-width sum is {total_width}, expected 64 bits.")
-
-if not os.path.isfile(instruction_file):
-    sys.exit(f"Error: File '{instruction_file}' not found.")
-
-hex_width = math.ceil(total_width / 4)  # 16 hex digits
-all_errors = []
+import re
 
 
-# Pass 1: Parse labels and separate raw instructions
+# Handles octal, binary, and hexadecimal integer parsing
+def parse_int(val_str):    
+    val_str = val_str.strip().lower()
+    try:
+        if val_str.startswith('0x') or val_str.startswith('-0x'):
+            return int(val_str, 16)
+        elif val_str.startswith('0b') or val_str.startswith('-0b'):
+            return int(val_str, 2)
+        elif val_str.startswith('0o') or val_str.startswith('-0o'):
+            return int(val_str, 8)
+        return int(val_str)
+    except ValueError:
+        return None
 
-labels = {}
-instructions = []  # List of tuples: (line_num, instr_address, raw_instruction_text)
-current_address = 0
+def main():
+    parser = argparse.ArgumentParser(description="Uno ISA 64-bit Assembler")
+    parser.add_argument("input", nargs='?', default="instructions.s", help="Input assembly file (.s)")
+    parser.add_argument("-o", "--output", default="instruction.mem", help="Output hex file (.mem)")
+    args = parser.parse_args()
 
-with open(instruction_file, "r") as infile:
-    for line_num, raw_line in enumerate(infile, start=1):
-        line = raw_line.split("#")[0].strip()
-        if not line:
+    try:
+        with open(args.input, 'r') as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        print(f"Error: Could not open {args.input}")
+        sys.exit(1)
+
+    labels = {}
+    instructions = []
+    
+
+    # Extract labels and clean instructions
+
+    addr = 0
+    for line_num, line in enumerate(lines, start=1):
+        clean_line = line.split('#')[0].strip()
+        if not clean_line:
+            continue
+            
+        if clean_line.endswith(':'):
+            label_name = clean_line[:-1].strip()
+            labels[label_name] = addr
+        else:
+            instructions.append((line_num, addr, clean_line))            
+            addr += 1
+
+   
+    # Parse operands, resolve labels, pack bits
+    
+    machine_code = []
+    errors = []
+
+    for line_num, current_addr, instr_str in instructions:
+        match = re.match(r'^uno\s+(.+)$', instr_str, re.IGNORECASE)
+        if not match:
+            errors.append(f"Line {line_num}: Invalid syntax. Expected 'uno <op1>, <op2>, <op3>, <op4>, <op5>'")
+            continue
+            
+        operands = [op.strip() for op in match.group(1).split(',')]
+        if len(operands) != 5:
+            errors.append(f"Line {line_num}: Expected 5 operands, got {len(operands)}")
             continue
 
-        # Handle label definitions (e.g. "loop:" or "loop: uno 0, 1, 2, loop, 0")
-        while ":" in line:
-            label_part, remaining = line.split(":", 1)
-            label_name = label_part.strip()
-
-            if not label_name.isidentifier():
-                all_errors.append(f"Line {line_num}: Invalid label name '{label_name}'.")
-            elif label_name in labels:
-                all_errors.append(f"Line {line_num}: Duplicate label definition '{label_name}'.")
-            else:
-                labels[label_name] = current_address
-
-            line = remaining.strip()
-
-        if line:
-            instructions.append((line_num, current_address, line))
-            current_address += 1
-
-
-# Pass 2: Assemble instructions and resolve fields
-
-valid_hex_outputs = []
-
-for line_num, addr, line in instructions:
-    parts = line.split(maxsplit=1)
-    opcode = parts[0]
-
-    if opcode.lower() != "uno":
-        all_errors.append(
-            f"Line {line_num}: Unrecognized opcode '{opcode}'. Expected 'uno'."
-        )
-        continue
-
-    if len(parts) < 2:
-        all_errors.append(f"Line {line_num}: Missing operands for '{opcode}'.")
-        continue
-
-    fields = [f.strip() for f in parts[1].split(",") if f.strip()]
-
-    if len(fields) != len(width):
-        all_errors.append(
-            f"Line {line_num}: Expected {len(width)} fields, but got {len(fields)}."
-        )
-        continue
-
-    binary_fields = []
-    line_has_error = False
-
-    for i, (field, w) in enumerate(zip(fields, width), start=1):
-        val = None
-
-        # Field 4 is the Jump target: check if it's a label first
-        if i == 4 and field in labels:
-            val = labels[field]
-        else:
-            try:
-                val = int(field, 0)
-            except ValueError:
-                all_errors.append(
-                    f"Line {line_num}: Field {i} ('{field}') is not a valid integer or known label."
-                )
-                line_has_error = True
+        vals = [0] * 5
+        
+        for i, op in enumerate(operands):
+            if i == 3 and op in labels:               
+                vals[i] = labels[op] - current_addr                
                 continue
-
-        # Field 5 is Data (allow signed -128..127 or unsigned 0..255)
-        if i == 5:
-            min_val = -(1 << (w - 1))
-            max_val = (1 << w) - 1
-            if val < min_val or val > max_val:
-                all_errors.append(
-                    f"Line {line_num}: Field {i} ({field} = {val}) out of range ({min_val} to {max_val})."
-                )
-                line_has_error = True
+                
+            val = parse_int(op)
+            if val is None:
+                errors.append(f"Line {line_num}: Invalid number or undefined label '{op}'")
                 continue
-            if val < 0:
-                val = (1 << w) + val  # 2's complement conversion
-        else:
-            # Address and Jump fields (strictly unsigned within field bit-width)
-            max_val = (1 << w) - 1
-            if val < 0 or val > max_val:
-                all_errors.append(
-                    f"Line {line_num}: Field {i} ({field} = {val}) out of range (0 to {max_val})."
-                )
+            vals[i] = val
+
+        line_has_error = False
+        
+        for i in range(3):
+            if not (0 <= vals[i] <= 32767):
+                errors.append(f"Line {line_num}: Field {i+1} ({vals[i]}) out of range (0 to 32767)")
                 line_has_error = True
-                continue
+                
+        if not (-1024 <= vals[3] <= 1023):
+            errors.append(f"Line {line_num}: Jump offset ({vals[3]}) out of range (-1024 to 1023)")
+            line_has_error = True
+            
+        if not (-128 <= vals[4] <= 255):
+            errors.append(f"Line {line_num}: Immediate data ({vals[4]}) out of range (-128 to 255)")
+            line_has_error = True
 
-        binary_fields.append(f"{val:0{w}b}")
+        if line_has_error:
+            continue
 
-    if not line_has_error:
-        binary_str = "".join(binary_fields)
-        hex_str = f"{int(binary_str, 2):0{hex_width}X}"
-        valid_hex_outputs.append(hex_str)
+        addr_1 = vals[0] & 0x7FFF
+        addr_2 = vals[1] & 0x7FFF
+        addr_3 = vals[2] & 0x7FFF
+        jump   = vals[3] & 0x7FF
+        data   = vals[4] & 0xFF
 
+        word = (addr_1 << 49) | (addr_2 << 34) | (addr_3 << 19) | (jump << 8) | data
+        machine_code.append(f"{word:016X}")
 
-# Error reporting and file output
+    if errors:
+        print("Assembly failed with errors:")
+        for err in errors:
+            print(f"  [-] {err}")
+        sys.exit(1)
 
-if all_errors:
-    print(f"\n[-] Assembly aborted with {len(all_errors)} error(s):")
-    for err in all_errors:
-        print(f"    {err}")
-    sys.exit(1)
+    with open(args.output, 'w') as f:
+        for code in machine_code:
+            f.write(code + '\n')
+            
+    print(f"Successfully assembled {len(machine_code)} instructions to {args.output}")
 
-try:
-    with open(output_file, "w") as mem_file:
-        for out in valid_hex_outputs:
-            mem_file.write(out + "\n")
-    print(f"[+] Assembly successful: {len(valid_hex_outputs)} instructions written to '{output_file}'.")
-except OSError as e:
-    sys.exit(f"Error writing '{output_file}': {e}")
+if __name__ == "__main__":
+    main()
